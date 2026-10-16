@@ -27,7 +27,7 @@ CATEGORIES_PATH = BASE_DIR / "categories.json"
 load_dotenv(PROJECT_DIR / ".env")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-DB_SSL = os.environ.get("DB_SSL", "disable").lower()
+DB_SSL = os.environ.get("DB_SSL", "require").lower()
 
 MAX_AMOUNT = 1_000_000_000
 MAX_TEXT_LENGTH = 1000
@@ -189,8 +189,15 @@ async def get_pool() -> asyncpg.Pool:
         if _pool is not None and not _pool.is_closing():
             return _pool
 
+        database_url = os.environ.get("DATABASE_URL")
+
+        if not database_url:
+            raise RuntimeError(
+                "DATABASE_URL must be configured before database access."
+            )
+
         _pool = await asyncpg.create_pool(
-            dsn=DATABASE_URL,
+            dsn=database_url,
             min_size=1,
             max_size=10,
             command_timeout=30,
