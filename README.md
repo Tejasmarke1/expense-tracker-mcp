@@ -19,6 +19,43 @@ This creates or updates the project environment and installs the `fastmcp` depen
 
 ## Run the MCP server
 
+The HTTP server is the authenticated implementation in `server.py`:
+
+```powershell
+uv run fastmcp run fastmcp.json
+```
+
+It listens at `http://127.0.0.1:8000/mcp` and loads `DATABASE_URL` and
+`MCP_USERS_JSON` from `.env`. Every HTTP request must include a bearer token
+whose value is one of the keys in `MCP_USERS_JSON`.
+
+Do not test this endpoint by opening it directly in a browser. A browser visit
+does not send the bearer token and correctly receives `401 Unauthorized`.
+
+Configure an HTTP-capable MCP client with the endpoint and an authorization
+header. Use the token value from `.env`; do not commit the token to client
+configuration files:
+
+```json
+{
+	"url": "http://127.0.0.1:8000/mcp",
+	"headers": {
+		"Authorization": "Bearer <token-from-MCP_USERS_JSON>"
+	}
+}
+```
+
+For a raw connectivity check, the request also needs MCP's negotiated `Accept`
+header:
+
+```powershell
+curl.exe -H "Authorization: Bearer <token-from-MCP_USERS_JSON>" `
+	-H "Accept: text/event-stream, application/json" `
+	http://127.0.0.1:8000/mcp
+```
+
+The older SQLite demo can still be started with:
+
 Start the server with:
 
 ```powershell
