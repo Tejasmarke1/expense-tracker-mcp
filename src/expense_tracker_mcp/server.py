@@ -12,8 +12,6 @@ from typing import AsyncIterator
 import asyncpg
 from dotenv import load_dotenv
 from fastmcp import FastMCP
-from fastmcp.server.auth import StaticTokenVerifier
-from fastmcp.server.dependencies import get_access_token
 
 
 # ============================================================
@@ -26,72 +24,100 @@ CATEGORIES_PATH = BASE_DIR / "categories.json"
 
 load_dotenv(PROJECT_DIR / ".env")
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_SSL = os.environ.get("DB_SSL", "require").lower()
+
+# Single-user mode: every Horizon-authorized caller shares this owner.
+# This is NOT per-user identity derived from OAuth.
+USER_ID = "personal-expense-owner"
 
 MAX_AMOUNT = 1_000_000_000
 MAX_TEXT_LENGTH = 1000
 
-
 if DB_SSL not in {"disable", "require"}:
     raise RuntimeError("DB_SSL must be 'disable' or 'require'.")
 
-# Each configured token maps to one internal expense owner.
-try:
-    USERS = json.loads(os.environ.get("MCP_USERS_JSON", ""))
-except json.JSONDecodeError:
-    raise RuntimeError("MCP_USERS_JSON must be valid JSON.") from None
-
-if not isinstance(USERS, dict) or not USERS:
-    raise RuntimeError("Configure at least one user in MCP_USERS_JSON.")
-
-for token, user in USERS.items():
-    if (
-        not isinstance(token, str)
-        or not token.strip()
-        or not isinstance(user, dict)
-        or not isinstance(user.get("client_id"), str)
-        or not user["client_id"].strip()
-        or not isinstance(user.get("scopes"), list)
-        or not all(
-            isinstance(scope, str) for scope in user["scopes"]
-        )
-    ):
-        raise RuntimeError("Invalid MCP user configuration.")
-
-USER_IDS = [user["client_id"] for user in USERS.values()]
-
-if len(set(USER_IDS)) != len(USER_IDS):
-    raise RuntimeError("Each token must have a unique client_id.")
-
-auth = StaticTokenVerifier(tokens=USERS)
-
-mcp = FastMCP("Expenses", auth=auth)
+# Horizon manages access to the hosted MCP endpoint.
+# No StaticTokenVerifier or MCP_USERS_JSON is used here.
+mcp = FastMCP("Expenses")
 
 _pool: asyncpg.Pool | None = None
 _pool_lock = asyncio.Lock()
+_db_initialized = False
+_db_init_lock = asyncio.Lock()
 
 
 # ============================================================
-# AUTHENTICATION
+# DATABASE
 # ============================================================
 
-def require_user(required_scope: str) -> str:
-    """Get the verified owner identity from the authenticated token."""
-    access_token = get_access_token()
+async def get_pool() -> asyncpg.Pool:
+    global _pool
 
-    if access_token is None:
-        raise PermissionError("Authentication required.")
+    if _pool is not None and not _pool.is_closing():
+        return _pool
 
-    if required_scope not in access_token.scopes:
-        raise PermissionError("Insufficient permissions.")
+    async with _pool_lock:
+        if _pool is not None and not _pool.is_closing():
+            return _pool
 
-    user_id = access_token.client_id
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url:
+            raise RuntimeError(
+                "DATABASE_URL must be configured before database access."
+            )
 
-    if not user_id:
-        raise PermissionError("Authenticated identity is missing.")
+        _pool = await asyncpg.create_pool(
+            dsn=database_url,
+            min_size=1,
+            max_size=10,
+            command_timeout=30,
+            ssl="require" if DB_SSL == "require" else None,
+        )
+        return _pool
 
-    return user_id
+
+async def init_db() -> None:
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS expenses (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                date DATE NOT NULL,
+                time TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL CHECK (amount > 0),
+                category TEXT NOT NULL,
+                subcategory TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT ''
+            )
+        """)
+
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_expenses_user_date
+            ON expenses(user_id, date)
+        """)
+
+
+async def ensure_db() -> None:
+    global _db_initialized
+
+    if _db_initialized:
+        return
+
+    async with _db_init_lock:
+        if not _db_initialized:
+            await init_db()
+            _db_initialized = True
+
+
+@asynccontextmanager
+async def get_db() -> AsyncIterator[asyncpg.Connection]:
+    await ensure_db()
+    pool = await get_pool()
+
+    async with pool.acquire() as conn:
+        yield conn
 
 
 # ============================================================
@@ -114,9 +140,7 @@ def validate_text(
         raise ValueError(f"{field} cannot be empty.")
 
     if len(value) > max_length:
-        raise ValueError(
-            f"{field} cannot exceed {max_length} characters."
-        )
+        raise ValueError(f"{field} cannot exceed {max_length} characters.")
 
     return value
 
@@ -160,7 +184,6 @@ def validate_amount(value: float) -> float:
 def validate_id(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("expense_id must be a positive integer.")
-
     return value
 
 
@@ -171,91 +194,6 @@ def validate_date_range(start_date: Date, end_date: Date) -> None:
 
 def error_response(message: str) -> dict[str, object]:
     return {"status": "error", "message": message}
-
-
-# ============================================================
-# POSTGRESQL CONNECTION POOL
-# ============================================================
-
-async def get_pool() -> asyncpg.Pool:
-    global _pool
-
-    if _pool is not None and not _pool.is_closing():
-        return _pool
-
-    async with _pool_lock:
-        if _pool is not None and not _pool.is_closing():
-            return _pool
-
-        database_url = os.environ.get("DATABASE_URL")
-
-        if not database_url:
-            raise RuntimeError(
-                "DATABASE_URL must be configured before database access."
-            )
-
-        _pool = await asyncpg.create_pool(
-            dsn=database_url,
-            min_size=1,
-            max_size=10,
-            command_timeout=30,
-            ssl="require" if DB_SSL == "require" else None,
-        )
-
-        return _pool
-
-
-async def init_db() -> None:
-    pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS expenses (
-                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                date DATE NOT NULL,
-                time TEXT NOT NULL,
-                amount DOUBLE PRECISION NOT NULL CHECK (amount > 0),
-                category TEXT NOT NULL,
-                subcategory TEXT NOT NULL DEFAULT '',
-                note TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-
-        await conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_expenses_user_date
-            ON expenses(user_id, date)
-            """
-        )
-
-
-_db_initialized = False
-_db_init_lock = asyncio.Lock()
-
-
-async def ensure_db() -> None:
-    global _db_initialized
-
-    if _db_initialized:
-        return
-
-    async with _db_init_lock:
-        if not _db_initialized:
-            await init_db()
-            _db_initialized = True
-
-
-@asynccontextmanager
-async def get_db() -> AsyncIterator[asyncpg.Connection]:
-    await ensure_db()
-
-    pool = await get_pool()
-
-    async with pool.acquire() as conn:
-        yield conn
 
 
 # ============================================================
@@ -271,37 +209,25 @@ async def add_expenses(
     subcategory: str = "",
     note: str = "",
 ) -> dict[str, object]:
-    """Add an expense for the authenticated user."""
-    user_id = require_user("write")
-
+    """Add an expense to the personal expense tracker."""
     try:
         expense_date = validate_date(date)
         expense_time = validate_time(time)
         amount = validate_amount(amount)
         category = validate_text(category, "category", max_length=100)
-        subcategory = validate_text(
-            subcategory, "subcategory", required=False
-        )
+        subcategory = validate_text(subcategory, "subcategory", required=False)
         note = validate_text(note, "note", required=False)
 
         async with get_db() as conn:
-            expense_id = await conn.fetchval(
-                """
+            expense_id = await conn.fetchval("""
                 INSERT INTO expenses (
                     user_id, date, time, amount,
                     category, subcategory, note
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
-                """,
-                user_id,
-                expense_date,
-                expense_time,
-                amount,
-                category,
-                subcategory,
-                note,
-            )
+            """, USER_ID, expense_date, expense_time, amount,
+                 category, subcategory, note)
 
         return {"status": "ok", "id": expense_id}
 
@@ -320,28 +246,20 @@ async def list_expenses(
     start_date: str,
     end_date: str,
 ) -> list[dict[str, object]]:
-    """List the authenticated user's expenses in a date range."""
-    user_id = require_user("read")
-
+    """List expenses within a date range."""
     start = validate_date(start_date)
     end = validate_date(end_date)
     validate_date_range(start, end)
 
     try:
         async with get_db() as conn:
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT id, date::text AS date, time, amount,
                        category, subcategory, note
                 FROM expenses
-                WHERE user_id = $1
-                  AND date BETWEEN $2 AND $3
+                WHERE user_id = $1 AND date BETWEEN $2 AND $3
                 ORDER BY date DESC, time DESC, id DESC
-                """,
-                user_id,
-                start,
-                end,
-            )
+            """, USER_ID, start, end)
 
         return [dict(row) for row in rows]
 
@@ -359,9 +277,7 @@ async def summarize(
     end_date: str,
     category: str | None = None,
 ) -> list[dict[str, object]]:
-    """Summarize the authenticated user's spending by category."""
-    user_id = require_user("read")
-
+    """Summarize spending by category within a date range."""
     start = validate_date(start_date)
     end = validate_date(end_date)
     validate_date_range(start, end)
@@ -369,8 +285,7 @@ async def summarize(
     try:
         async with get_db() as conn:
             if category is None:
-                rows = await conn.fetch(
-                    """
+                rows = await conn.fetch("""
                     SELECT category,
                            ROUND(SUM(amount)::numeric, 2)::float8
                                AS total_amount
@@ -378,15 +293,12 @@ async def summarize(
                     WHERE user_id = $1 AND date BETWEEN $2 AND $3
                     GROUP BY category
                     ORDER BY category
-                    """,
-                    user_id, start, end,
-                )
+                """, USER_ID, start, end)
             else:
                 category = validate_text(
                     category, "category", max_length=100
                 )
-                rows = await conn.fetch(
-                    """
+                rows = await conn.fetch("""
                     SELECT category,
                            ROUND(SUM(amount)::numeric, 2)::float8
                                AS total_amount
@@ -396,14 +308,10 @@ async def summarize(
                       AND category = $4
                     GROUP BY category
                     ORDER BY category
-                    """,
-                    user_id, start, end, category,
-                )
+                """, USER_ID, start, end, category)
 
         return [dict(row) for row in rows]
 
-    except ValueError as exc:
-        raise ValueError(str(exc)) from None
     except asyncpg.PostgresError:
         raise RuntimeError("Could not summarize expenses.") from None
 
@@ -415,12 +323,9 @@ async def summarize(
 @mcp.resource("expense://categories", mime_type="application/json")
 async def categories() -> str:
     """Return configured expense categories."""
-    require_user("read")
-
     try:
         with CATEGORIES_PATH.open("r", encoding="utf-8") as file:
             data = json.load(file)
-
         return json.dumps(data, indent=2, ensure_ascii=False)
 
     except FileNotFoundError:
@@ -445,9 +350,7 @@ async def edit_expense(
     subcategory: str | None = None,
     note: str | None = None,
 ) -> dict[str, object]:
-    """Update supplied fields of the authenticated user's expense."""
-    user_id = require_user("write")
-
+    """Update supplied fields of an expense."""
     try:
         expense_id = validate_id(expense_id)
 
@@ -461,9 +364,7 @@ async def edit_expense(
             "subcategory": lambda v: validate_text(
                 v, "subcategory", required=False
             ),
-            "note": lambda v: validate_text(
-                v, "note", required=False
-            ),
+            "note": lambda v: validate_text(v, "note", required=False),
         }
 
         supplied = {
@@ -484,29 +385,25 @@ async def edit_expense(
         if not updates:
             return error_response("Provide at least one field to update.")
 
-        # Column names come exclusively from the fixed allowlist above.
         assignments = [
             f"{column} = ${index}"
             for index, column in enumerate(updates, start=3)
         ]
-
-        params = [user_id, expense_id, *updates.values()]
+        params = [USER_ID, expense_id, *updates.values()]
 
         async with get_db() as conn:
-            async with conn.transaction():
-                query = (
-                    f"UPDATE expenses SET {', '.join(assignments)} "
-                    "WHERE user_id = $1 AND id = $2 RETURNING id"
-                )
+            updated_id = await conn.fetchval(
+                f"UPDATE expenses SET {', '.join(assignments)} "
+                "WHERE user_id = $1 AND id = $2 RETURNING id",
+                *params,
+            )
 
-                updated_id = await conn.fetchval(query, *params)
-
-                if updated_id is None:
-                    return error_response("Expense not found.")
+        if updated_id is None:
+            return error_response("Expense not found.")
 
         return {
             "status": "ok",
-            "id": expense_id,
+            "id": updated_id,
             "updated_fields": list(updates.keys()),
         }
 
@@ -521,25 +418,17 @@ async def edit_expense(
 # ============================================================
 
 @mcp.tool()
-async def delete_expense(
-    expense_id: int,
-) -> dict[str, object]:
-    """Delete an expense belonging to the authenticated user."""
-    user_id = require_user("write")
-
+async def delete_expense(expense_id: int) -> dict[str, object]:
+    """Delete an expense by its ID."""
     try:
         expense_id = validate_id(expense_id)
 
         async with get_db() as conn:
-            deleted_id = await conn.fetchval(
-                """
+            deleted_id = await conn.fetchval("""
                 DELETE FROM expenses
                 WHERE id = $1 AND user_id = $2
                 RETURNING id
-                """,
-                expense_id,
-                user_id,
-            )
+            """, expense_id, USER_ID)
 
         if deleted_id is None:
             return error_response("Expense not found.")
@@ -557,7 +446,7 @@ async def delete_expense(
 
 
 # ============================================================
-# SERVER STARTUP
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
