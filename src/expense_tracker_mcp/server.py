@@ -32,8 +32,6 @@ DB_SSL = os.environ.get("DB_SSL", "require").lower()
 MAX_AMOUNT = 1_000_000_000
 MAX_TEXT_LENGTH = 1000
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required.")
 
 if DB_SSL not in {"disable", "require"}:
     raise RuntimeError("DB_SSL must be 'disable' or 'require'.")
